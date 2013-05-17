@@ -1,0 +1,103 @@
+#!/usr/bin/env python
+import errno
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+ini_template = """[databases]
+{dbname} = host={host} port={port} dbname={dbname}
+
+[pgbouncer]
+pidfile = /tmp/pgbouncer.pid
+logfile = /tmp/pgbouncer.log
+auth_file = {user_text_path}
+"""
+
+users_template = """"{user}" "{password}"
+"""
+
+
+def conninfo_to_dict(conninfo):
+    out = {}
+    parts = conninfo.split(' ')
+
+    for maybe_pair in parts:
+        keyword, value = maybe_pair.split('=')
+        out[keyword] = value
+
+    return out
+
+
+def start_pgbouncer(info):
+    # Copy info so it can be mutated
+    info = dict(info)
+
+    with tempfile.NamedTemporaryFile(prefix='pgbouncer_users_',
+                                     delete=False) as f:
+        f.write(users_template.format(**info))
+        user_path = f.name
+
+    # PGBouncer implements a small keychain of its own, in the user
+    # text file, so get rid of the credentials from the dictionary for
+    # use in the pgbouncer.ini template.
+    info.pop('user', None)
+    info.pop('password', None)
+
+    with tempfile.NamedTemporaryFile(prefix='pgbouncerini_',
+                                     delete=False) as f:
+        info.update({'user_text_path': user_path})
+        f.write(ini_template.format(**info))
+        ini_path = f.name
+
+    subprocess.check_call(['pgbouncer', '--daemon', ini_path])
+
+
+def wait_for_pgbouncer():
+    while True:
+        try:
+            # See if pgbouncer is already started
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect('/tmp/.s.PGSQL.6432')
+            s.close()
+            return
+        except EnvironmentError, e:
+            if e.errno in (errno.ENOENT, errno.ECONNREFUSED):
+                time.sleep(0.1)
+            else:
+                raise
+
+
+def main():
+    where = sys.stdin.read()
+    info = conninfo_to_dict(where)
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    try:
+        # See if pgbouncer is already started
+        s.connect('/tmp/.s.PGSQL.6432')
+        s.close()
+    except EnvironmentError, e:
+        if e.errno == errno.ENOENT:
+            start_pgbouncer(info)
+            wait_for_pgbouncer()
+        else:
+            raise
+
+    # Okay, hopefully now pgbouncer is started, all that's left to do
+    # is replace the 'host' information for the libpq that called this
+    # resolver.
+    info.pop('host', None)
+    info.get('hostaddr', None)
+    info['host'] = '/tmp'
+    info['port'] = '6432'
+
+    # Format the modified input back into a connstr,
+    # e.g. 'dbname=... host=...'
+    sys.stdout.write(' '.join('='.join(pair) for pair in info.items()))
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
