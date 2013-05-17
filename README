@@ -1,0 +1,207 @@
+On Wed, Jan 9, 2013 at 5:17 AM, Peter Eisentraut wrote:
+> I would like to have something like ssh-askpass for libpq.  The main
+> reason is that I don't want to have passwords in plain text on disk,
+> even if .pgpass is read protected.  By getting the password from an
+> external program, I can integrate libpq tools with the host system's key
+> chain or wallet thing, which stores passwords encrypted.
+>
+> I'm thinking about adding a new connection option "askpass" with
+> environment variable PGASKPASS.  One thing I haven't quite figured out
+> is how to make this ask for passwords only if needed.  Maybe it needs
+> two connection options, one to say which program to use and one to say
+> whether to use it.
+>
+> Ideas?
+
+Okay, I have a patch that does something *like* (but not the same) as
+this, and whose implementation is totally unreasonable, but it's
+enough to get a sense of how the whole thing feels.  Critically, it
+goes beyond askpass, instead allowing a shell-command based hook for
+arbitrary interpretation and rewriting of connection info...such as
+the 'host' libpq keyword.  I have called it, without much thought, a
+'resolver'.  In this way, it's closer to the libpq 'service' facility,
+except with addition of complete control of the interpretation of
+user-provided notation.
+
+I think it would be useful to have an in-process equivalent
+(e.g. loading hooks via dynamic linking, like the backend), if the
+functionality seems worthwhile, mostly for performance and a richer
+protocol between libpq and resolvers (error messages come to mind).  I
+think with a bit of care this also would allow other drivers to more
+easily implement some of the features grown into libpq (by re-using
+the shared-object's protocol, or a generic wrapper that can load the
+shared object to provide a command line interface), like the .pgpass
+file and the services file, which are often missing from new driver
+implementations.
+
+With these disclaimers out of the way, here's a 'demo'.  It's long,
+but hopefully not as dense as it first appears since it's mostly a
+narration of walking through using this.
+
+Included alongside the patch is a short program that integrates with
+the freedesktop.org secret service standard, realized in the form of
+libsecret (I don't know exactly what the relationship is, but I used
+libsecret's documentation[0]).  This resolver I wrote is not a solid
+piece of work either, much like the libpq patch I've attached...but, I
+probably will try to actually make personal use of this for a time
+after fixing a handful of things to feel it out over an extended
+period.
+
+On Debian, one needs gir1.2-secret-1 and Python 2.7.  I run this on
+Ubuntu Raring, and have traced my steps using the GNOME Keyring used
+there, Seahorse.
+
+# This tool has some help:
+$ ./pq-secret-service -h
+$ ./pq-secret-service store -h
+$ ./pq-secret-service recall -h
+
+# Store a secret:
+$ printf 'dbname=regression host=localhost port=5432 user=user'\
+' password=password' | ./pq-secret-service store
+
+Now, you can check your keyring manager, and search for 'postgres' or
+'postgresql'.  You should see a stored PostgreSQL secret, probably
+labeled "PostgreSQL Database Information"
+
+After having compiled a libpq with my patch applied and making sure a
+'psql' is using that libpq...
+
+# Set the 'resolve' command:
+$ export PGRESOLVE='/path/to/pq-secret-service recall'
+
+# Attempt to connect to regression database.  The credentials are
+# probably not enabled on your database, and so you'll see the
+# appropriate error message instead.
+$ psql regression
+
+What this does is searches the keyrings in the most straightforward
+way given the Secret Service protocol to try to 'complete' the input
+passed, based on any of the (non-secret) parts of the passed conninfo
+to 'pq-secret-service store'.
+
+Here's an example where the resolver opts to not load something from
+the keyring:
+
+$ psql 'dbname=regression user=not-the-one-stored'
+
+Now the resolver doesn't find a secret, so it just passes-through the
+original connection info.  Ditto if one passes a password.  Here are
+more examples, this time explored by invoking the resolver command
+directly, without having to go through libpq.  This makes testing and
+experimentation somewhat easier:
+
+$ echo $(printf 'regression' | ./pq-secret-service recall)
+$ echo $(printf 'dbname=regression' | ./pq-secret-service recall)
+$ echo $(printf 'host=localhost port=5432' | ./pq-secret-service recall)
+
+# Show failing to match the secret (the input provided will be
+# returned unchanged):
+$ echo $(printf 'host=elsewhere port=5432' | ./pq-secret-service recall)
+
+In some aspects the loose matching is kind of neat, because usually
+some subset of database names, role names, and host names are
+sufficient to find the right thing, but this is besides the point: the
+resolver program can be made very strict, or lax, or can even try
+opening a database connection to feel things out.  I do want to make
+sure that at least some useful baseline functionality can be
+implemented, though, so wrangling the details of one or more
+defensible sample resolver program is something I want to do.
+
+In addition, there are two more advanced features in the
+'pq-secret-service' resolver: labels, and shorthands.  These are *not*
+concepts seen in the patch to libpq, whose main feature in this is the
+ability to hand off the user's input to some arbitrary other program.
+
+'label's are part of the Secret Service, and provide a human readable
+entry in one's keyring program.  I default it to "PostgreSQL Database
+Information".  It is not used in matching credentials and connection
+information in any way:
+
+$ printf 'dbname=regression host=localhost port=5432 user=user'\
+' password=password' |                                         \
+  ./pq-secret-service store                                    \
+  --label='My Secure Postgres Regression Database'
+
+Then, check your keyring program.  It'll probably display 'My Secure
+Postgres Regression Database' somewhere.  If you ran the previous
+steps, you will get a message like this:
+
+    Adding this secret would be ambiguous with another keyring entry
+    with the attributes: {'user': 'user', 'host': 'localhost',
+    'dbname': 'regression', 'port': '5432'}
+
+In this way, resolvers can also be useful independent programs: libpq
+wouldn't nominally invoke the 'store' action at all, it only cares
+about 'recall'.  You can delete the old credentials from your keyring
+to successfully run this command (I don't know how to do that working
+from the docs[0]).  But, given the label is not semantically
+significant to libpq, you can opt to continue without doing that...
+
+Moving on, 'shorthands' are a jargon of my hand (and not a Secret
+Service feature, unlike 'label') that are very similar to service
+definitions and the feature that I want the most badly:
+
+$ printf 'dbname=regression host=localhost port=5432 user=user'
+' password=password' | ./pq-secret-service store --shorthand=regress
+
+$ psql regress
+
+Note that this is ambiguous with database names: shorthands take
+priority over the implicit-dbname connection string form.
+Furthermore, they and don't need to follow any libpq quoting rules: if
+it's database-name-like, it is passed to the resolver verbatim, and if
+it's connection-string-like, the resolver gets to have a look before
+running any libpq parser (which might reject the input).  I think this
+property of complete control to interpret user input is very
+important.
+
+Demo done.
+
+Next demo:
+
+What follows is a different use case entirely: client side proxying.
+Shown below is an interaction with a pgbouncer resolver (also included
+in this mail), as is useful to an application that uses a fork-based
+web server and wants pooling, but doesn't want to run centralized
+pgbouncer infrastructure.  The multiplexing of, say, four or more
+forked backends to one pgbouncer, even pushed to the client, can be
+operationally really useful.
+
+WARNING: this program will litter some temporary files in /tmp
+(prefixed with pgbouncer, to assist in deletion), and is missing some
+useful features, and is suspect to port clashing if one is already
+running pgbouncer with default settings.
+
+$ export PGRESOLVE=/path/to/pq-pgbouncer-resolver
+$ psql 'dbname=regression host=elsewhere user=someone password=secret'
+
+This resolver assumes it can start up pgbouncer on its default port
+(6543) should it not already be started.  When doing this, it sets up
+pgbouncer configuration files in a particular way to be able to
+service the user's passed connection string that triggered the
+pgbouncer start-up.  After that, this implementation assumes that all
+connections are going to the same place, not taking care to update
+pgbouncer's configuration to 'learn' new database routes.
+
+Beyond the start-up step, the resolver is pretty simple: it overwrites
+the host and port libpq keywords in the conninfo passed by the user to
+point at the started pgbouncer, so what happens is the resolution
+yields:
+
+ host=/tmp port=6543 dbname=regression user=someone password=secret'
+
+Demo done.
+
+Next Demo, a short one:
+
+$ export PGRESOLVE='pq-secret-service recall | pq-pgbouncer-resolver'
+$ psql theshorthand
+
+This will expand the shorthand using one's keyring, and then
+subsequently pipe the output of that to the pgbouncer resolver, which
+can do its deed to get the connection to use pgbouncer.
+
+Thanks for getting through all that text.  Fin.  And, thoughts?
+
+[0]: https://developer.gnome.org/libsecret/unstable/index.html
