@@ -149,7 +149,7 @@ $ psql regress
 
 Note that this is ambiguous with database names: shorthands take
 priority over the implicit-dbname connection string form.
-Furthermore, they and don't need to follow any libpq quoting rules: if
+Furthermore, they don't need to follow any libpq quoting rules: if
 it's database-name-like, it is passed to the resolver verbatim, and if
 it's connection-string-like, the resolver gets to have a look before
 running any libpq parser (which might reject the input).  I think this
@@ -177,7 +177,7 @@ $ export PGRESOLVE=/path/to/pq-pgbouncer-resolver
 $ psql 'dbname=regression host=elsewhere user=someone password=secret'
 
 This resolver assumes it can start up pgbouncer on its default port
-(6543) should it not already be started.  When doing this, it sets up
+(6432) should it not already be started.  When doing this, it sets up
 pgbouncer configuration files in a particular way to be able to
 service the user's passed connection string that triggered the
 pgbouncer start-up.  After that, this implementation assumes that all
@@ -189,7 +189,7 @@ the host and port libpq keywords in the conninfo passed by the user to
 point at the started pgbouncer, so what happens is the resolution
 yields:
 
- host=/tmp port=6543 dbname=regression user=someone password=secret'
+ host=/tmp port=6432 dbname=regression user=someone password=secret'
 
 Demo done.
 
